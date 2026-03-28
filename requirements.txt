@@ -1,0 +1,10 @@
+streamlit
+boto3
+torch
+git+https://github.com/openai/CLIP.git
+numpy
+Pillow
+lancedb
+pyarrow
+scikit-learn
+python-dotenv

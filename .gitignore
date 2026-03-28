@@ -1,0 +1,16 @@
+# Ignore env file
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+venv/
+.env/
+
+# Streamlit cache
+.streamlit/
+
+# OS files
+.DS_Store
