@@ -1,21 +1,26 @@
-print("File started")
-
+import streamlit as st
 import boto3
-import os
-import json
 import torch
 import clip
 import numpy as np
-import matplotlib.pyplot as plt
 from PIL import Image
 import io
-from sklearn.metrics.pairwise import cosine_similarity
+import lancedb
+import pyarrow as pa
+from sklearn.cluster import KMeans
+import os
 from dotenv import load_dotenv
 
+# =========================
+# LOAD ENV
+# =========================
 load_dotenv()
 
 UPLOAD_BUCKET = os.getenv("S3_BUCKET")
 
+# =========================
+# AWS S3 CLIENT
+# =========================
 s3 = boto3.client(
     "s3",
     aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
@@ -23,134 +28,211 @@ s3 = boto3.client(
     region_name=os.getenv("AWS_REGION")
 )
 
-# Load CLIP model
-model, preprocess = clip.load("ViT-B/32")
+# =========================
+# DEVICE (GPU/CPU)
+# =========================
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
+# =========================
+# LOAD MODEL (CACHED)
+# =========================
+@st.cache_resource
+def load_model():
+    model, preprocess = clip.load("ViT-B/32", device=device)
+    return model, preprocess
 
-def find_folder(folder_name):
-    """Find folder in current directory ignoring case"""
-    cwd = os.getcwd()
-    for f in os.listdir(cwd):
-        if os.path.isdir(f) and f.lower() == folder_name.lower():
-            return f
-    return None
+model, preprocess = load_model()
 
+# =========================
+# LANCEDB SETUP
+# =========================
+db = lancedb.connect("./lancedb")
+table_name = "image_vectors"
 
-def upload_folder(folder):
-    """Upload all images in folder to S3, including subfolders"""
-    for root, _, files in os.walk(folder):
-        for file in files:
-            if file.lower().endswith((".jpg", ".png", ".jpeg")):
-                path = os.path.join(root, file)
-                key = os.path.relpath(path, folder)  # preserve folder structure
-                s3.upload_file(path, BUCKET, key)
-                print("Uploaded:", key)
+def init_db():
+    try:
+        # Try opening table
+        return db.open_table(table_name)
 
+    except Exception:
+        # If not exists → create it
+        schema = pa.schema([
+            ("id", pa.string()),
+            ("embedding", pa.list_(pa.float32(), 512)),
+            ("path", pa.string()),
+            ("metadata", pa.struct([
+                ("primary_color", pa.string()),
+                ("colors", pa.list_(pa.string()))
+            ]))
+        ])
 
-def get_embedding(path):
-    """Generate CLIP embedding for a single image"""
-    image = Image.open(path).convert("RGB")
-    image_tensor = preprocess(image).unsqueeze(0)
+        return db.create_table(table_name, schema=schema)
+
+table = init_db()
+
+# =========================
+# COLOR EXTRACTION
+# =========================
+def extract_colors(image, k=3):
+    try:
+        image = image.resize((100, 100))
+        arr = np.array(image).reshape((-1, 3))
+
+        kmeans = KMeans(n_clusters=k, n_init=10)
+        kmeans.fit(arr)
+
+        colors = kmeans.cluster_centers_.astype(int)
+        color_list = [f"{c[0]}-{c[1]}-{c[2]}" for c in colors]
+
+        return color_list[0], color_list
+    except:
+        return "0-0-0", []
+
+# =========================
+# COLOR DISTANCE
+# =========================
+def color_distance(c1, c2):
+    try:
+        r1, g1, b1 = map(int, c1.split("-"))
+        r2, g2, b2 = map(int, c2.split("-"))
+        return np.sqrt((r1-r2)**2 + (g1-g2)**2 + (b1-b2)**2)
+    except:
+        return 999
+
+# =========================
+# EMBEDDING
+# =========================
+def get_embedding(image):
+    image = image.convert("RGB")
+    image_tensor = preprocess(image).unsqueeze(0).to(device)
+
     with torch.no_grad():
         emb = model.encode_image(image_tensor)
-    return emb[0].numpy()
 
+    emb = emb[0].cpu().numpy()
+    emb = emb / np.linalg.norm(emb)
 
-def create_index(folder):
-    """Create embeddings for all images and save each embedding individually to S3"""
-    print("Scanning folder:", folder)
-    total = 0
+    return emb.astype(np.float32)
 
-    for root, _, files in os.walk(folder):
-        for file in files:
-            if file.lower().endswith((".jpg", ".png", ".jpeg")):
-                path = os.path.join(root, file)
-                print("Processing:", path)
-                emb = get_embedding(path).tolist()
+# =========================
+# S3 IMAGE FETCH
+# =========================
+@st.cache_data
+def get_s3_image(key):
+    try:
+        obj = s3.get_object(Bucket=UPLOAD_BUCKET, Key=key)
+        return Image.open(io.BytesIO(obj["Body"].read()))
+    except:
+        return None
 
-                # Save each embedding as a separate JSON in S3
-                emb_key = os.path.relpath(path, folder) + ".json"  # e.g., single/img1.jpg.json
+# =========================
+# THUMBNAIL
+# =========================
+def show_thumbnail(image):
+    img = image.copy()
+    img.thumbnail((150, 150))
+    return img
+
+# =========================
+# UI
+# =========================
+st.title("🖼️ Image Search (S3 + LanceDB + CLIP)")
+
+option = st.selectbox("Choose Action", ["Upload Images", "Search Image"])
+
+# =========================
+# UPLOAD
+# =========================
+if option == "Upload Images":
+
+    uploaded_files = st.file_uploader(
+        "Upload images",
+        type=["jpg", "png", "jpeg"],
+        accept_multiple_files=True
+    )
+
+    if uploaded_files:
+        for file in uploaded_files:
+            try:
+                file_name = file.name
+                file_bytes = file.read()
+
+                # Upload to S3
                 s3.put_object(
-                    Bucket=BUCKET,
-                    Key=emb_key,
-                    Body=json.dumps({"file": path, "embedding": emb}, indent=4)
+                    Bucket=UPLOAD_BUCKET,
+                    Key=file_name,
+                    Body=file_bytes
                 )
-                total += 1
 
-    if total == 0:
-        print("No images found! Check your folder path or file extensions.")
-    else:
-        print(f"\nTotal images processed and embeddings uploaded: {total}")
+                image = Image.open(io.BytesIO(file_bytes))
 
+                emb = get_embedding(image)
+                primary_color, all_colors = extract_colors(image)
 
-def search(query_path, top_k=5):
-    """Search similar images using embeddings stored individually in S3 and show them"""
-    query_emb = get_embedding(query_path)
+                table.add([{
+                    "id": file_name,
+                    "embedding": emb.tolist(),
+                    "path": file_name,
+                    "metadata": {
+                        "primary_color": primary_color,
+                        "colors": all_colors
+                    }
+                }])
 
-    # List embedding JSON files in S3
-    response = s3.list_objects_v2(Bucket=BUCKET)
-    objects = response.get("Contents", [])
-    embeddings_files = [obj['Key'] for obj in objects if obj['Key'].endswith(".json")]
+                st.image(show_thumbnail(image), caption=file_name)
+                st.success(f"Uploaded: {file_name}")
 
-    results = []
+            except Exception as e:
+                st.error(f"Error: {str(e)}")
 
-    for emb_key in embeddings_files:
-        # Load embedding JSON from S3
-        obj = s3.get_object(Bucket=BUCKET, Key=emb_key)
-        content = obj['Body'].read()
-        data = json.loads(content)
+# =========================
+# SEARCH
+# =========================
+elif option == "Search Image":
 
-        # Check if the JSON is valid
-        if isinstance(data, dict) and "embedding" in data:
-            sim = cosine_similarity([query_emb], [np.array(data["embedding"])])[0][0]
-            results.append((data["file"], sim, emb_key.replace(".json", "")))
-        else:
-            print(f"Skipping invalid embedding file: {emb_key}")
+    query_file = st.file_uploader("Upload query image")
 
-    if not results:
-        print("No embeddings found in S3 for search!")
-        return
+    if query_file:
+        query_bytes = query_file.read()
+        query_image = Image.open(io.BytesIO(query_bytes))
 
-    # Sort by similarity
-    results.sort(key=lambda x: x[1], reverse=True)
+        st.image(show_thumbnail(query_image), caption="Query")
 
-    print("\nTop Matches:")
-    for r in results[:top_k]:
-        print(f"{r[0]} -> Similarity: {r[1]:.4f}")
+        query_emb = get_embedding(query_image)
+        query_primary, _ = extract_colors(query_image)
 
-    # Show top images visually
-    fig, axes = plt.subplots(1, min(top_k, len(results)), figsize=(4*min(top_k, len(results)), 4))
-    if top_k == 1 or len(results) == 1:
-        axes = [axes]
+        results = table.search(query_emb).limit(30).to_list()
 
-    for i, (file_path, sim, img_key) in enumerate(results[:top_k]):
-        obj = s3.get_object(Bucket=BUCKET, Key=img_key)  # get actual image
-        img = Image.open(io.BytesIO(obj['Body'].read()))
-        axes[i].imshow(img)
-        axes[i].set_title(f"{sim:.2f}")
-        axes[i].axis('off')
+        st.subheader("Results")
 
-    plt.show()
+        found = False
 
+        for r in results:
+            metadata = r.get("metadata", {})
+            db_color = metadata.get("primary_color")
 
-if __name__ == "__main__":
-    folder = find_folder("assets")
-    if not folder:
-        print("Error: 'assets' folder not found in current directory!")
-        exit()
+            # Color filter
+            if db_color:
+                dist = color_distance(query_primary, db_color)
+                if dist > 100:
+                    continue
 
-    print("1. Upload images to S3")
-    print("2. Create embeddings index (S3 vector-style)")
-    print("3. Search similar images")
+            db_emb = np.array(r["embedding"], dtype=np.float32)
+            similarity = np.dot(query_emb, db_emb)
 
-    choice = input("Enter choice: ")
+            if similarity < 0.7:
+                continue
 
-    if choice == "1":
-        upload_folder(folder)
+            img = get_s3_image(r["path"])
+            if img is None:
+                continue
 
-    elif choice == "2":
-        create_index(folder)
+            found = True
 
-    elif choice == "3":
-        query = input("Enter query image path: ")
-        search(query)
+            st.image(
+                show_thumbnail(img),
+                caption=f"{r['path']} | Score: {similarity:.2f}"
+            )
+
+        if not found:
+            st.warning("No good match found")
